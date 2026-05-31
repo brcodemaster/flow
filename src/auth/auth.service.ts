@@ -1,9 +1,10 @@
-import { ConflictException, Injectable, UnauthorizedException } from '@nestjs/common'
+import { ConflictException, Inject, Injectable, UnauthorizedException } from '@nestjs/common'
 import { JwtService } from '@nestjs/jwt'
 
 import { Session, User } from '@generated/client'
 import { compare } from 'bcrypt'
 import ms from 'ms'
+import { type RedisClientType } from 'redis'
 import { v4 as uuidV4 } from 'uuid'
 
 import { TJwtPayload } from '@/common/types'
@@ -17,7 +18,10 @@ export class AuthService {
 	constructor(
 		private readonly userService: UserService,
 		private readonly jwtService: JwtService,
-		private readonly prisma: PrismaService
+		private readonly prisma: PrismaService,
+
+		@Inject('REDIS_CLIENT')
+		private readonly redis: RedisClientType
 	) {}
 
 	async logIn(payload: LoginRequestDto): Promise<{
@@ -41,7 +45,9 @@ export class AuthService {
 		return { user: existingUser, accessToken, refreshToken, session }
 	}
 
-	async logOut(accessToken: string): Promise<Session> {
+	async logOut(accessToken: string, refreshToken?: string): Promise<Session> {
+		if (!refreshToken) throw new UnauthorizedException('Please authenticate first')
+
 		let payload: null | (TJwtPayload & { sessionId: string })
 
 		try {
@@ -49,10 +55,14 @@ export class AuthService {
 				sessionId: string
 			}
 		} catch (error) {
-			throw new UnauthorizedException('Invalid refresh token' + ' ' + error)
+			throw new UnauthorizedException('Invalid access token' + ' ' + error)
 		}
 
 		if (!payload) throw new UnauthorizedException()
+
+		await this.redis.del(`session:${refreshToken}`)
+
+		await this.redis.lRem(`sessions:${payload.sub}`, 0, refreshToken)
 
 		return await this.prisma.session.delete({
 			where: {
@@ -110,31 +120,6 @@ export class AuthService {
 	private async getToken(
 		user: User
 	): Promise<{ refreshToken: string; session: Session; accessToken: string }> {
-		const sessionCount = await this.prisma.session.count({
-			where: {
-				userId: user.id
-			}
-		})
-
-		if (sessionCount >= 3) {
-			const session = await this.prisma.session.findFirst({
-				where: {
-					userId: user.id
-				},
-				orderBy: {
-					createdAt: 'asc'
-				}
-			})
-
-			if (session) {
-				await this.prisma.session.delete({
-					where: {
-						id: session.id
-					}
-				})
-			}
-		}
-
 		const refreshToken = this.jwtService.sign(
 			{ sub: user.id, role: user.role },
 			{ expiresIn: '7d', jwtid: uuidV4() }
@@ -151,6 +136,28 @@ export class AuthService {
 		const accessToken = this.jwtService.sign(
 			{ sub: user.id, role: user.role, sessionId: session.id },
 			{ expiresIn: '15m' }
+		)
+
+		await this.redis.lPush(`sessions:${user.id}`, refreshToken)
+
+		const tokensToDelete = await this.redis.lRange(`sessions:${user.id}`, 3, -1)
+
+		await this.redis.lTrim(`sessions:${user.id}`, 0, 2)
+
+		if (tokensToDelete.length > 0) {
+			for (const token of tokensToDelete) {
+				await this.redis.del(`session:${token}`)
+				await this.prisma.session.deleteMany({ where: { token } })
+			}
+		}
+
+		await this.redis.set(
+			`session:${refreshToken}`,
+			JSON.stringify({
+				userId: user.id,
+				sessionId: session.id
+			}),
+			{ EX: 60 * 60 * 24 * 7 }
 		)
 
 		return { refreshToken, session, accessToken }

@@ -41,9 +41,10 @@ export class AuthController {
 	@Post('sign-out')
 	@HttpCode(HttpStatus.OK)
 	async logOut(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
-		const accessToken = req.headers.authorization || ''
+		const accessToken = (req.headers.authorization || '').replace('Bearer ', '')
+		const refreshToken = req.cookies['x-refresh-token']
 
-		await this.authService.logOut(accessToken.replace('Bearer ', ''))
+		await this.authService.logOut(accessToken, refreshToken)
 
 		res.clearCookie('x-refresh-token', { path: '/auth' })
 
@@ -66,6 +67,7 @@ export class AuthController {
 	@HttpCode(HttpStatus.OK)
 	async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
 		const refreshToken = req.cookies['x-refresh-token']
+		console.log(refreshToken)
 
 		const { accessToken, refreshToken: newRefreshToken } =
 			await this.authService.refresh(refreshToken)
